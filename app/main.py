@@ -25,7 +25,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         config = settings or Settings()
         store = Store(config.database_path)
-        await store.open()
+        await store.open(config.telegram_chat_id)
         tasks = []
         try:
             async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:

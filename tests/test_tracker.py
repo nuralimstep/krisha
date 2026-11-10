@@ -100,19 +100,20 @@ async def test_history_survives_restart_and_new_items_queue_once(tmp_path):
     store = Store(tmp_path / "db.sqlite3")
     await store.open()
     try:
+        await store.subscribe(42)
         assert await store.record_scan([flat()], {"123"}) == 1
-        await store.mark_sent("123")
+        await store.mark_sent("123", 42)
     finally:
         await store.close()
     store = Store(tmp_path / "db.sqlite3")
     await store.open()
     try:
         assert await store.record_scan([flat(), flat(id="124")], {"123", "124"}) == 1
-        assert [item["id"] for item in await store.pending()] == ["124"]
+        assert [item["id"] for item in await store.pending(42)] == ["124"]
         assert await store.record_scan([flat(), flat(id="124")], {"123", "124"}) == 0
         await store.record_scan([], set())
         assert await store.latest() == []
-        assert await store.pending() == []
+        assert await store.pending(42) == []
     finally:
         await store.close()
 
@@ -121,9 +122,10 @@ async def test_initial_scan_limits_alerts_without_dropping_future_new_offers(tmp
     store = Store(tmp_path / "db.sqlite3")
     await store.open()
     try:
+        await store.subscribe(42)
         initial = [flat(id=str(i)) for i in range(10)]
         assert await store.record_scan(initial, {item.id for item in initial}) == 5
-        assert len(await store.pending()) == 5
+        assert len(await store.pending(42)) == 5
         assert await store.record_scan(initial, {item.id for item in initial}) == 0
         assert await store.record_scan([flat(id="999")], {"999"}) == 1
     finally:
@@ -141,19 +143,20 @@ async def test_telegram_failure_retains_pending_notification(tmp_path):
     store = Store(config.database_path)
     await store.open()
     try:
+        await store.subscribe(42)
         await store.record_scan([flat()], {"123"})
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
             tracker = Tracker(config, store, client)
             await tracker.deliver()
-            assert len(await store.pending()) == 1
+            assert len(await store.pending(42)) == 1
             await tracker.deliver()
             assert len(calls) == 1  # retry_after respected
     finally:
         await store.close()
 
 
-async def test_pairing_rejects_strangers_and_groups(tmp_path):
-    config = settings(tmp_path, telegram_bot_token="private-token", bot_access_code="secret-access-code")
+async def test_any_private_user_can_start_but_groups_are_ignored(tmp_path):
+    config = settings(tmp_path, telegram_bot_token="private-token", telegram_chat_id=42)
     store = Store(config.database_path)
     await store.open()
     try:
@@ -164,18 +167,16 @@ async def test_pairing_rejects_strangers_and_groups(tmp_path):
             def update(chat_id, text, kind="private"):
                 return {"message": {"chat": {"id": chat_id, "type": kind}, "text": text}}
 
-            await tracker.handle_update(update(7, "/start wrong"))
-            await tracker.handle_update(update(7, "/start неверный-код"))
-            await tracker.handle_update(update(7, "/start secret-access-code", "group"))
-            assert await tracker.chat_id() is None
-            await tracker.handle_update(update(42, "/start secret-access-code"))
-            assert await tracker.chat_id() == 42
-            await tracker.handle_update(update(7, "/start secret-access-code"))
+            await tracker.handle_update(update(7, "/start", "group"))
+            assert await store.subscription_counts() == {"total": 0, "active": 0}
+            await tracker.handle_update(update(42, "/start"))
+            await tracker.handle_update(update(7, "/start"))
+            assert await store.subscription_counts() == {"total": 2, "active": 2}
             await tracker.handle_update(update(7, "/stop"))
-            assert await tracker.chat_id() == 42
-            assert await store.get_meta("paused") == "0"
+            assert (await store.subscriber(7))["paused"] == 1
+            assert (await store.subscriber(42))["paused"] == 0
             await tracker.handle_update(update(42, "/stop"))
-            assert await store.get_meta("paused") == "1"
+            assert (await store.subscriber(42))["paused"] == 1
     finally:
         await store.close()
 

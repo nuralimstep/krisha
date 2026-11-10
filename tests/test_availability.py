@@ -48,6 +48,7 @@ def sent(message_id=9, age_hours=0):
 async def store(tmp_path):
     instance = Store(tmp_path / "test.sqlite3")
     await instance.open()
+    await instance.subscribe(42)
     await instance.record_scan([flat()], {"123"})
     try:
         yield instance
@@ -169,12 +170,12 @@ async def test_migrates_original_database_without_losing_queue(tmp_path):
         )
         db.execute("INSERT INTO outbox VALUES ('123', NULL)")
     migrated = Store(path)
-    await migrated.open()
+    await migrated.open(42)
     try:
-        assert [item["id"] for item in await migrated.pending()] == ["123"]
+        assert [item["id"] for item in await migrated.pending(42)] == ["123"]
         assert await migrated.messages_to_clean(42) == []
         await migrated.set_availability("123", "removed")
-        assert await migrated.pending() == []
+        assert await migrated.pending(42) == []
     finally:
         await migrated.close()
 
@@ -183,22 +184,24 @@ async def test_manual_inactive_survives_scans_and_restart(tmp_path):
     path = tmp_path / "persist.sqlite3"
     first = Store(path)
     await first.open()
+    await first.subscribe(42)
     await first.record_scan([flat()], {"123"})
     await first.mark_sent("123", 42, sent())
-    await first.set_availability("123", "manual")
+    await first.hide_listing(42, "123")
     await first.close()
     second = Store(path)
     await second.open()
     try:
         assert await second.record_scan([flat()], {"123"}) == 0
-        assert await second.latest() == []
-        assert await second.pending() == []
+        assert await second.latest(chat_id=42) == []
+        assert await second.pending(42) == []
         assert len(await second.messages_to_clean(42)) == 1
-        assert await second.availability_candidates(300, 20) == []
+        assert await second.availability_candidates(300, 20) == ["123"]
         # A stale in-flight request cannot undo an explicit removal.
         await second.set_availability("123", "active")
-        assert await second.latest() == []
-        assert (await second.counts())["inactive"] == 1
+        assert await second.latest(chat_id=42) == []
+        assert (await second.counts(42))["inactive"] == 1
+        assert len(await second.latest()) == 1
     finally:
         await second.close()
 
@@ -279,7 +282,7 @@ async def test_deliver_and_latest_remember_all_message_ids(store, config, no_wai
 async def test_auto_removed_ad_cleans_all_copies_even_when_paused(store, config, no_wait):
     await store.mark_sent("123", 42, sent(9))
     await store.remember_message("123", 42, sent(10))
-    await store.set_meta("paused", "1")
+    await store.pause_subscriber(42)
     deleted = []
 
     def respond(request):
@@ -398,6 +401,7 @@ async def test_button_requires_owner_and_saved_message(store, config):
             assert len(await store.latest()) == 1
         assert answered == []
         await tracker.handle_update({"callback_query": query()})
-        assert await store.latest() == []
+        assert await store.latest(chat_id=42) == []
+        assert len(await store.latest()) == 1
         assert len(await store.messages_to_clean(42)) == 1
         assert len(answered) == 1

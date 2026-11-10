@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import secrets
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -24,16 +23,13 @@ class Tracker:
         self.scan_lock = asyncio.Lock()
         self.last_error: str | None = None
         self.telegram_error: str | None = None
-        self.delivery_error: str | None = None
+        self.delivery_errors: dict[int, str] = {}
         self.availability_error: str | None = None
         self.availability_retry_at = 0.0
         self.last_success_at: str | None = None
         self.last_count = 0
-        self.delivery_retry_at = 0.0
-
-    async def chat_id(self) -> int | None:
-        saved = await self.store.get_meta("chat_id")
-        return self.settings.telegram_chat_id or (int(saved) if saved else None)
+        self.delivery_retry_at: dict[int, float] = {}
+        self.telegram_retry_at = 0.0
 
     async def scan(self):
         async with self.scan_lock:
@@ -54,43 +50,46 @@ class Tracker:
                 raise
 
     async def deliver(self):
-        chat_id = await self.chat_id()
-        if not self.telegram or not chat_id:
+        if not self.telegram:
             return
         loop = asyncio.get_running_loop()
-        if loop.time() < self.delivery_retry_at:
+        if loop.time() < self.telegram_retry_at:
             return
+        for subscriber in await self.store.subscribers():
+            chat_id = subscriber["chat_id"]
+            if loop.time() < self.delivery_retry_at.get(chat_id, 0):
+                continue
+            try:
+                await self._deliver_to(chat_id)
+            except TelegramError as exc:
+                self.delivery_errors[chat_id] = str(exc)
+                self.delivery_retry_at[chat_id] = loop.time() + max(exc.retry_after, 30)
+                if exc.code == 403:
+                    await self.store.pause_subscriber(chat_id, blocked=True)
+                logger.warning("Subscriber delivery deferred: %s", exc)
+                if exc.code == 429:
+                    self.telegram_retry_at = self.delivery_retry_at[chat_id]
+                    return
+                continue
+            self.delivery_errors.pop(chat_id, None)
+
+    async def _deliver_to(self, chat_id: int):
         # Cleaning already-sent cards continues even while new alerts are paused.
         for message in await self.store.messages_to_clean(chat_id):
-            try:
-                old = datetime.now(UTC) - datetime.fromisoformat(message["sent_at"]) >= timedelta(hours=48)
-                await self.telegram.remove_listing_message(
-                    chat_id, message["message_id"], json.loads(message["payload"]), old=old
-                )
-            except TelegramError as exc:
-                self.delivery_error = str(exc)
-                self.delivery_retry_at = loop.time() + max(exc.retry_after, 30)
-                logger.warning("Message cleanup deferred: %s", exc)
-                return
+            old = datetime.now(UTC) - datetime.fromisoformat(message["sent_at"]) >= timedelta(hours=48)
+            await self.telegram.remove_listing_message(
+                chat_id, message["message_id"], json.loads(message["payload"]), old=old
+            )
             await self.store.mark_message_cleaned(chat_id, message["message_id"])
-            self.delivery_error = None
             await asyncio.sleep(1.1)
-        if await self.store.get_meta("paused") == "1":
-            return
-        for listing in await self.store.pending():
-            try:
-                message = await self.telegram.send(
-                    chat_id, listing_message(listing), listing_id=listing["id"]
-                )
-            except TelegramError as exc:
-                self.delivery_error = str(exc)
-                self.delivery_retry_at = loop.time() + max(exc.retry_after, 30)
-                logger.warning("Delivery deferred: %s", exc)
+        # Bound each chat's batch so a subscriber with a backlog doesn't monopolize the loop.
+        for listing in await self.store.pending(chat_id, limit=5):
+            if (await self.store.subscriber(chat_id))["paused"]:
                 break
+            message = await self.telegram.send(chat_id, listing_message(listing), listing_id=listing["id"])
             # Mark only after Telegram acknowledges receipt. A crash between these
             # steps can repeat a message; Telegram has no idempotency key.
             await self.store.mark_sent(listing["id"], chat_id, message)
-            self.delivery_error = None
             await asyncio.sleep(1.1)
 
     async def watch(self):
@@ -138,7 +137,9 @@ class Tracker:
             await asyncio.sleep(self.settings.poll_interval_seconds)
             await self.recheck_availability()
 
-    async def status(self):
+    async def status(self, chat_id: int | None = None):
+        subscriber = await self.store.subscriber(chat_id) if chat_id is not None else None
+        subscriptions = await self.store.subscription_counts()
         return {
             "search": {
                 "city": "Алматы",
@@ -152,13 +153,19 @@ class Tracker:
             "poll_interval_seconds": self.settings.poll_interval_seconds,
             "availability_interval_seconds": self.settings.availability_interval_seconds,
             "telegram_configured": self.telegram is not None,
-            "chat_connected": await self.chat_id() is not None,
-            "paused": await self.store.get_meta("paused") == "1",
+            "chat_connected": subscriptions["total"] > 0,
+            "subscribers": subscriptions,
+            "paused": bool(subscriber["paused"]) if subscriber else None,
             "last_success_at": self.last_success_at or await self.store.get_meta("last_scan_at") or None,
             "source_error": self.last_error,
             "availability_error": self.availability_error,
-            "telegram_error": self.telegram_error or self.delivery_error,
-            "counts": await self.store.counts(),
+            "telegram_error": self.telegram_error
+            or (
+                self.delivery_errors.get(chat_id)
+                if chat_id is not None
+                else next(iter(self.delivery_errors.values()), None)
+            ),
+            "counts": await self.store.counts(chat_id),
         }
 
     async def handle_update(self, update: dict):
@@ -167,45 +174,32 @@ class Tracker:
             return
         message = update.get("message", {})
         chat = message.get("chat", {})
-        # Pair only a private chat and never answer unrelated users.
-        if chat.get("type") != "private" or not isinstance(chat.get("id"), int):
+        # Commands are accepted from any private Telegram chat, never from groups.
+        if chat.get("type") != "private" or type(chat.get("id")) is not int or chat["id"] <= 0:
             return
         incoming_id = chat["id"]
         text = message.get("text", "").strip()
         parts = text.split(maxsplit=1)
         command = parts[0].split("@")[0] if parts else ""
-        connected = await self.chat_id()
-        if connected is None:
-            code = parts[1] if len(parts) > 1 else ""
-            expected = self.settings.bot_access_code.get_secret_value()
-            if (
-                command != "/start"
-                or not expected
-                or not secrets.compare_digest(
-                    code.encode(),
-                    expected.encode(),
-                )
-            ):
-                return
-            await self.store.set_meta("chat_id", str(incoming_id))
-        elif connected != incoming_id:
-            return
-
         if command == "/start":
-            await self.store.set_meta("paused", "0")
+            await self.store.subscribe(incoming_id)
+            self.delivery_retry_at.pop(incoming_id, None)
+            self.delivery_errors.pop(incoming_id, None)
             await self.telegram.send(
                 incoming_id,
                 "Отслеживаю однокомнатные квартиры в Алматы за "
                 f"{self.settings.min_price:,}–{self.settings.max_price:,} ₸/месяц.\n"
                 f"Проверка каждые {self.settings.poll_interval_seconds} сек.\n"
                 "/latest — последние варианты\n/status — состояние\n/stop — пауза\n"
-                "Кнопка «Уже сдали» убирает неактуальный вариант.",
+                "Кнопка «Уже сдали» убирает вариант только из вашего списка.",
             )
+        elif await self.store.subscriber(incoming_id) is None:
+            await self.telegram.send(incoming_id, "Нажмите /start, чтобы подписаться на новые квартиры.")
         elif command == "/stop":
-            await self.store.set_meta("paused", "1")
+            await self.store.pause_subscriber(incoming_id)
             await self.telegram.send(incoming_id, "Уведомления приостановлены. /start — продолжить.")
         elif command == "/latest":
-            listings = await self.store.latest()
+            listings = await self.store.latest(chat_id=incoming_id)
             if not listings:
                 await self.telegram.send(
                     incoming_id, "Подходящих вариантов пока нет. /status — состояние поиска."
@@ -217,7 +211,7 @@ class Tracker:
                 await self.store.remember_message(listing["id"], incoming_id, message)
                 await asyncio.sleep(1.1)
         elif command == "/status":
-            status = await self.status()
+            status = await self.status(incoming_id)
             state = "Ошибка загрузки Krisha" if self.last_error else "Поиск работает"
             if not status["last_success_at"]:
                 state = "Ожидаю первую успешную проверку"
@@ -233,16 +227,19 @@ class Tracker:
                     else ""
                 ),
             )
+        else:
+            await self.telegram.send(incoming_id, "/latest — квартиры\n/status — состояние\n/stop — пауза")
 
     async def handle_callback(self, query: dict):
-        chat_id = await self.chat_id()
         message = query.get("message", {})
         chat = message.get("chat", {})
+        chat_id = chat.get("id")
         if (
-            not chat_id
+            type(chat_id) is not int
+            or chat_id <= 0
             or query.get("from", {}).get("id") != chat_id
             or chat.get("type") != "private"
-            or chat.get("id") != chat_id
+            or await self.store.subscriber(chat_id) is None
         ):
             return
         action, _, listing_id = query.get("data", "").partition(":")
@@ -250,7 +247,7 @@ class Tracker:
             return
         if not await self.store.has_message(listing_id, chat_id, message.get("message_id")):
             return
-        await self.store.set_availability(listing_id, "manual")
+        await self.store.hide_listing(chat_id, listing_id)
         await self.telegram.call(
             "answerCallbackQuery", callback_query_id=query["id"], text="Убираю этот вариант."
         )
@@ -263,7 +260,18 @@ class Tracker:
                     "getUpdates", offset=offset, timeout=25, allowed_updates=["message", "callback_query"]
                 )
                 for update in updates:
-                    await self.handle_update(update)
+                    try:
+                        await self.handle_update(update)
+                    except TelegramError as exc:
+                        # A blocked bot or expired callback in one chat must not
+                        # prevent subsequent users' updates from being processed.
+                        if exc.code not in (400, 403):
+                            raise
+                        message = update.get("message") or update.get("callback_query", {}).get("message", {})
+                        chat_id = message.get("chat", {}).get("id")
+                        if exc.code == 403 and type(chat_id) is int:
+                            await self.store.pause_subscriber(chat_id, blocked=True)
+                        logger.warning("Telegram command could not be answered: %s", exc)
                     offset = update["update_id"] + 1
                     await self.store.set_meta("telegram_offset", str(offset))
                 self.telegram_error = None

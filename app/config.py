@@ -9,7 +9,6 @@ class Settings(BaseSettings):
 
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: int | None = None
-    bot_access_code: SecretStr = SecretStr("")
     admin_token: SecretStr = SecretStr("")
     poll_interval_seconds: int = Field(default=60, ge=30, le=3600)
     search_pages: int = Field(default=3, ge=1, le=20)
@@ -35,7 +34,4 @@ class Settings(BaseSettings):
             raise ValueError("MIN_PRICE must not exceed MAX_PRICE")
         if self.telegram_chat_id is not None and self.telegram_chat_id <= 0:
             raise ValueError("TELEGRAM_CHAT_ID must be a private chat ID")
-        if self.telegram_bot_token.get_secret_value():
-            if not self.telegram_chat_id and len(self.bot_access_code.get_secret_value()) < 16:
-                raise ValueError("Set TELEGRAM_CHAT_ID or BOT_ACCESS_CODE (16+ characters)")
         return self
